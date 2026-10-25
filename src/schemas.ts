@@ -167,3 +167,20 @@ export const regenerateBody = z.object({ feedback: z.string().trim().max(2000).o
 export const buildChangesBody = z.object({ feedback: z.string().trim().max(2000).optional() });
 export const repoNameBody = z.object({ name: z.string().trim().min(1).max(100) });
 export const domainBody = z.object({ domain: z.string().trim().min(3).max(253) });
+
+/* ---------- Gestion d'un restaurant Yumco (carte, utilisateurs, commandes) ---------- */
+
+export const categoryBody = z.object({ name: text(120), kind: z.enum(['main', 'starter', 'drink', 'side', 'dessert', 'other']).default('other') });
+export const restaurantUserBody = z.object({
+  first_name: text(100),
+  last_name: text(100),
+  email,
+  phone: z.string().trim().max(30).nullable().optional(),
+  role: z.enum(['owner', 'manager', 'staff']),
+});
+const isoDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+export const ordersQuery = z.object({
+  status: z.enum(['pending', 'preparing', 'ready', 'completed', 'cancelled']).optional(),
+  date_from: isoDay.optional(),
+  date_to: isoDay.optional(),
+});

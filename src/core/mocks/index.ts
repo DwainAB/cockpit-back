@@ -1,25 +1,23 @@
 import { createAgents } from './agents';
-import { createContents } from './contents';
-import { createConversations } from './conversations';
-import { createMeetings } from './meetings';
-import { createActivities, createFinance, createNotifications, createSettings } from './misc';
+import { createSettings } from './misc';
 import { createProjects } from './projects';
-import { createRestaurants } from './restaurants';
-import { createTasks } from './tasks';
-import type { SiteDraft } from '../types';
+import type { Activity, AppNotification, Content, Conversation, Meeting, Restaurant, SiteDraft, Task } from '../types';
 
-/** Jeu de données complet. Remplacé plus tard par les réponses de l'API. */
+/**
+ * Données d'une base du cockpit vide : agents, projets et réglages (configuration), le reste démarre vide.
+ * Les restaurants viennent de la base Yumco.
+ */
 export const createSeed = () => ({
   agents: createAgents(),
   projects: createProjects(),
-  restaurants: createRestaurants(),
-  tasks: createTasks(),
-  contents: createContents(),
-  meetings: createMeetings(),
-  conversations: createConversations(),
-  notifications: createNotifications(),
-  activities: createActivities(),
-  finance: createFinance(),
+  restaurants: <Restaurant[]>[],
+  tasks: <Task[]>[],
+  contents: <Content[]>[],
+  meetings: <Meeting[]>[],
+  conversations: <Conversation[]>[],
+  notifications: <AppNotification[]>[],
+  activities: <Activity[]>[],
+  finance: { subscriptionPrice: 49, projects: [] },
   settings: createSettings(),
   drafts: <SiteDraft[]>[],
 });

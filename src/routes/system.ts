@@ -68,7 +68,7 @@ system.post('/integrations/:provider/sync', (req, res) => {
   res.status(503).json({ error: `Intégration « ${req.params.provider} » non connectée dans cette version.` });
 });
 
+/** Les données sont en base : la réinitialisation de la démo n'existe qu'en mode mock (navigateur). */
 system.post('/demo/reset', (_req, res) => {
-  store.reset();
-  res.json({ ok: true, version: store.currentVersion });
+  res.status(410).json({ error: 'Réinitialisation indisponible : les données du cockpit sont en base.' });
 });

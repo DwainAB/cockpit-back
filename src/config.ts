@@ -5,16 +5,18 @@ import { PLATFORM_BASE_URL, platformUrl, TEST_PLATFORM_RESTAURANT_ID } from './c
 // Charge backend/.env s'il existe (Node ≥ 20.12, sans dépendance).
 if (fs.existsSync('.env')) process.loadEnvFile('.env');
 
-const bool = (v: string | undefined, fallback: boolean) => (v === undefined ? fallback : v === 'true' || v === '1');
-
 export const config = {
   port: Number(process.env.PORT ?? 4000),
   corsOrigins: (process.env.CORS_ORIGIN ?? 'http://localhost:5173,http://127.0.0.1:5173')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean),
-  persist: bool(process.env.PERSIST, true),
-  dataFile: path.resolve(process.env.DATA_FILE ?? './data/db.json'),
+  /** Base PostgreSQL propre au cockpit : agents, dossiers de production, tâches, réunions, profils des restaurants… */
+  cockpitDatabaseUrl: process.env.COCKPIT_DATABASE_URL ?? '',
+  /** Base PostgreSQL de Yumco, lue seulement : source des restaurants (inscrits sur la plateforme). */
+  yumcoDatabaseUrl: process.env.YUMCO_DATABASE_URL ?? '',
+  /** Intervalle de relecture des restaurants dans la base Yumco. */
+  restaurantsRefreshMs: Number(process.env.RESTAURANTS_REFRESH_MS ?? 60_000),
   uploadsDir: path.resolve(process.env.UPLOADS_DIR ?? './data/uploads'),
   designsDir: path.resolve(process.env.DESIGNS_DIR ?? './data/designs'),
   /** `claude` si une clé API est présente, sinon `simulated` (aucune IA appelée). */
@@ -50,6 +52,9 @@ export const config = {
   yumcoApiUrl: (process.env.YUMCO_API_URL ?? 'https://yumco-back-production.up.railway.app').replace(/\/$/, ''),
   /** Même valeur que COCKPIT_API_KEY sur l'API. Absente : les questionnaires ne créent pas de restaurant (mode test). */
   yumcoApiKey: process.env.YUMCO_API_KEY ?? '',
+  /** Compte admin Yumco : gestion de la carte et des utilisateurs d'un restaurant, consultation des commandes. */
+  yumcoAdminEmail: process.env.YUMCO_ADMIN_EMAIL ?? '',
+  yumcoAdminPassword: process.env.YUMCO_ADMIN_PASSWORD ?? '',
   /** Intervalle de récupération des questionnaires remplis depuis un lien. */
   importIntervalMs: Number(process.env.IMPORT_INTERVAL_MS ?? 60_000),
   /** Taille maximale d'une image envoyée (Mo). */

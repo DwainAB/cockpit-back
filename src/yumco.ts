@@ -11,7 +11,7 @@ export interface YumcoSubmission extends Invitation {
 }
 
 /** Message lisible à partir d'une erreur de l'API (`{"detail": "..."}` ou liste d'erreurs de validation). */
-const describe = (body: unknown) => {
+export const describe = (body: unknown) => {
   const detail = (body as { detail?: unknown } | null)?.detail;
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) return detail.map((d: { loc?: unknown[]; msg?: string }) => `${(d.loc ?? []).slice(1).join('.')} : ${d.msg}`).join(' ; ');

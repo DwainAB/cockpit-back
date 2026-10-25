@@ -79,6 +79,8 @@ export interface Project {
 export type RestaurantStatus = 'prospect' | 'pending' | 'production' | 'active' | 'suspended';
 export type StripeStatus = 'not_started' | 'invite_to_send' | 'info_pending' | 'configured';
 export type BillingPlan = 'none' | 'trial' | 'subscribed';
+/** État du site d’un restaurant (fiche `restaurant_sites` de Yumco). */
+export type SiteStatus = 'design' | 'development' | 'online' | 'delivered';
 
 export type WorkflowStepKey =
   | 'intake'
@@ -422,6 +424,8 @@ export interface Restaurant {
   /** Site en ligne (domaine officiel) et code source, pour un restaurant issu de la production. */
   siteUrl?: string | null;
   repoUrl?: string | null;
+  /** État du site dans la base Yumco ; `delivered` : site livré avant le suivi des statuts. */
+  siteStatus?: SiteStatus;
 }
 
 

@@ -360,8 +360,13 @@ export const finalizeDraft = ({ db }: DomainContext, draftId: string) => {
   const a = draft.answers;
   const now = nowIso();
   const concept = draft.versions.find((v) => v.status === 'validated')?.concept;
+  // Les restaurants viennent de la base Yumco : le dossier complète la fiche du restaurant créé à l'envoi du questionnaire.
+  if (!draft.yumcoRestaurantId) throw new DomainError('Ce dossier n’est lié à aucun restaurant Yumco : impossible de le terminer.', 409);
+  const id = `yumco-${draft.yumcoRestaurantId}`;
+  const existing = db.restaurants.find((r) => r.id === id);
   const restaurant: Restaurant = {
-    id: uid('resto'),
+    ...existing,
+    id,
     name: a.name,
     cuisine: a.restaurantType,
     description: concept?.summary ?? '',
@@ -376,19 +381,23 @@ export const finalizeDraft = ({ db }: DomainContext, draftId: string) => {
     status: 'active',
     billing: 'subscribed',
     stripeStatus: 'not_started',
-    createdAt: now,
+    createdAt: existing?.createdAt ?? now,
     updatedAt: now,
     nextAction: 'Point de suivi à 1 mois',
-    internalNotes: '',
+    internalNotes: existing?.internalNotes ?? '',
     agentId: DEFAULT_STEP_AGENTS.delivery,
     blocker: null,
     workflow: buildWorkflow('all_done', { agents: DEFAULT_STEP_AGENTS, wantsPayment: false, startDaysAgo: 0, nowIso: () => now }),
-    memory: a.customRequests ? [{ id: uid('mem'), date: now, text: `Demandes particulières : ${a.customRequests}`, source: 'manual' }] : [],
+    memory: [
+      ...(a.customRequests ? [{ id: uid('mem'), date: now, text: `Demandes particulières : ${a.customRequests}`, source: 'manual' as const }] : []),
+      ...(existing?.memory ?? []),
+    ],
     accent: concept?.palette[0] ?? a.branding.colors[0] ?? '#3B4A9E',
     siteUrl,
     repoUrl: delivery.repoUrl,
   };
-  db.restaurants.unshift(restaurant);
+  if (existing) Object.assign(existing, restaurant);
+  else db.restaurants.unshift(restaurant);
   draft.finalizedAt = now;
   draft.restaurantId = restaurant.id;
   draft.updatedAt = now;

@@ -149,7 +149,10 @@ drafts.post(
       store.mutate((ctx) => markCredentialsSent(ctx, draft.id, sentAt));
       if (draft.delivery?.repoUrl) syncSite(draft.yumcoRestaurantId, { repo_url: draft.delivery.repoUrl });
     }
-    res.status(201).json(store.mutate((ctx) => finalizeDraft(ctx, req.params.id)));
+    const restaurant = store.mutate((ctx) => finalizeDraft(ctx, req.params.id));
+    // La fiche Yumco (site, dépôt, gérant) vient d'être mise à jour : on la relit.
+    void store.refreshRestaurants();
+    res.status(201).json(restaurant);
   }),
 );
 
