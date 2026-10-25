@@ -1,0 +1,7 @@
+node_modules
+dist
+*.tsbuildinfo
+# Secrets (voir .env.example)
+.env
+# Données locales : base JSON, maquettes, sites générés, images envoyées
+data/
