@@ -104,21 +104,34 @@ export const createPost = async (contentId: string, feedback: string | null = nu
 };
 
 /**
- * Publication sur un réseau. Les connecteurs (Facebook, Instagram, LinkedIn, TikTok) sont branchés réseau par réseau ;
- * sans connecteur, la publication échoue avec un message explicite.
+ * Publication sur un réseau, avec le compte que le projet du post y a connecté : chaque projet a ses propres
+ * comptes (Page Facebook, compte Instagram, page LinkedIn…). Les connecteurs arrivent réseau par réseau
+ * (connexion depuis la page Communication du projet) ; sans compte connecté, la publication échoue clairement.
  */
-type Publisher = (post: Content) => Promise<{ url?: string }>;
+export interface SocialAccount {
+  /** Identifiant du compte chez le réseau (Page, compte Instagram, organisation LinkedIn…). */
+  accountId: string;
+  name: string;
+  /** Jeton d'accès : conservé uniquement côté serveur, jamais envoyé au cockpit. */
+  accessToken: string;
+}
+type Publisher = (post: Content, account: SocialAccount) => Promise<{ url?: string }>;
 const publishers: Partial<Record<Network, Publisher>> = {};
+
+/** Compte connecté par un projet sur un réseau (à brancher sur la table des comptes avec la connexion OAuth). */
+const accountFor = (_projectId: string, _network: Network): SocialAccount | null => null;
 
 export const publishPost = async (contentId: string) => {
   if (!store.mutate(({ db }) => startPublishing(db, contentId))) return;
   const c = store.snapshot.contents.find((x) => x.id === contentId)!;
   const results: Partial<Record<Network, PublicationResult>> = {};
+  const projectName = store.snapshot.projects.find((p) => p.id === c.projectId)?.name ?? c.projectId;
   for (const network of pendingNetworks(c)) {
     const publish = publishers[network];
+    const account = accountFor(c.projectId, network);
     try {
-      if (!publish) throw new Error(`compte ${networkLabel[network]} non connecté (Paramètres → Réseaux sociaux)`);
-      const { url } = await publish(c);
+      if (!publish || !account) throw new Error(`aucun compte ${networkLabel[network]} connecté pour ${projectName} (page Communication du projet)`);
+      const { url } = await publish(c, account);
       results[network] = { status: 'published', at: new Date().toISOString(), url };
     } catch (err) {
       results[network] = { status: 'error', at: new Date().toISOString(), error: errorMessage(err) };
