@@ -9,6 +9,7 @@ import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import type Anthropic from '@anthropic-ai/sdk';
 import * as z from 'zod/v4';
 import {
+  siteAgent,
   completeBuild,
   dayKeys,
   dayLabels,
@@ -24,13 +25,15 @@ import {
   type DesignUsage,
   type SiteBuild,
   type SiteDraft,
+  RESTAURANT_PROJECT,
 } from './core';
 import { runChecks } from './checks';
 import { addUsage, claude, errorMessage, fallbackParams, responseText, usageOf } from './claude';
 import { config } from './config';
-import { imageBlock, readHtml } from './designer';
-import { openrouterJson } from './openrouter';
 import { store } from './store';
+import { imageBlock, readHtml } from './designer';
+import { memoryContext } from './memorySearch';
+import { openrouterJson } from './openrouter';
 import { uploadPath } from './uploads';
 
 /* ---------- Environnement Next.js partagé (installé une seule fois) ---------- */
@@ -226,6 +229,11 @@ const callDeveloper = async (draft: SiteDraft, build: SiteBuild, previous: Attem
   const html = readHtml(version.id) ?? '';
   const images = projectImages(draft);
   const a = draft.answers;
+  // L'agent choisi pour le développement (Paramètres → Agents IA) réalise le site avec son modèle « tâches ».
+  const agent = siteAgent(store.snapshot, 'development');
+  if (!agent) throw new Error('Aucun agent n’est chargé du développement des sites (Paramètres → Agents IA).');
+  const memoryQuery = [a.name, a.restaurantType, a.customRequests, version.seo?.title ?? ''].join(' ');
+  const system = `${SYSTEM_PROMPT}\n\nConsignes permanentes de l'agent (définies par le studio) :\n${await memoryContext(agent, memoryQuery, RESTAURANT_PROJECT)}`;
 
   const content: Anthropic.Beta.BetaContentBlockParam[] = [
     {
@@ -277,15 +285,16 @@ ${html}
   else if (lastBuild && build.feedback) content.push({ type: 'text', text: `Le studio a refusé le site avec cette remarque : « ${build.feedback} ». Modifie le code en conséquence.` });
   else content.push({ type: 'text', text: 'Développe le site.' });
 
-  const model = config.devModel;
-  if (config.devProvider === 'openrouter')
-    return openrouterJson({ model, system: SYSTEM_PROMPT, content, schema: DevOutput, maxTokens: 64000, effort: config.devEffort });
+  // Modèle de tâche de l'agent (réglé dans le cockpit), à défaut celui de la spécialité.
+  const { provider, model } = agent.models.task;
+  if (provider === 'openrouter')
+    return openrouterJson({ model, system, content, schema: DevOutput, maxTokens: 64000, effort: config.devEffort });
   const stream = claude().beta.messages.stream({
     model,
     max_tokens: 64000,
     thinking: { type: 'adaptive' },
     output_config: { effort: config.devEffort, format: zodOutputFormat(DevOutput) },
-    system: SYSTEM_PROMPT,
+    system,
     messages: [{ role: 'user', content }],
     ...fallbackParams(model),
   });

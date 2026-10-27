@@ -1,4 +1,4 @@
-/** Accès à l'API OpenRouter (compatible OpenAI) pour l'agent développeur. */
+/** Accès à l'API OpenRouter (compatible OpenAI) pour les agents réglés sur ce fournisseur. */
 import type Anthropic from '@anthropic-ai/sdk';
 import * as z from 'zod/v4';
 import type { DesignUsage } from './core';
@@ -27,6 +27,87 @@ const httpError = async (res: Response) => {
   if (res.status === 402) return 'Crédit insuffisant sur le compte OpenRouter.';
   if (res.status === 429) return 'Limite de requêtes OpenRouter atteinte (modèles gratuits limités). Réessayez dans un moment.';
   return `Erreur de l’API OpenRouter (${res.status})${detail ? ` : ${detail}` : '.'}`;
+};
+
+/** Génération d'une image (modèles d'images d'OpenRouter, payants à l'usage) : renvoie le fichier et la consommation. */
+export const openrouterImage = async (opts: { model: string; prompt: string; aspectRatio: string }): Promise<{ data: Buffer; usage: DesignUsage }> => {
+  if (!config.openrouterApiKey) throw new Error('Clé API OpenRouter absente (OPENROUTER_API_KEY dans backend/.env).');
+  const res = await fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.openrouterApiKey}`, 'Content-Type': 'application/json', 'X-Title': 'Cockpit' },
+    body: JSON.stringify({
+      model: opts.model,
+      modalities: ['image', 'text'],
+      image_config: { aspect_ratio: opts.aspectRatio },
+      messages: [{ role: 'user', content: opts.prompt }],
+    }),
+    signal: AbortSignal.timeout(3 * 60 * 1000),
+  }).catch((err: unknown) => {
+    throw new Error(`Impossible de joindre l’API OpenRouter (${err instanceof Error ? err.message : 'erreur réseau'}).`);
+  });
+  if (!res.ok) throw new Error(await httpError(res));
+  const body = (await res.json()) as {
+    model?: string;
+    error?: { message?: string };
+    choices?: { message?: { images?: { image_url?: { url?: string } }[] } }[];
+    usage?: Usage;
+  };
+  if (body.error) throw new Error(`Erreur de l’API OpenRouter : ${body.error.message ?? 'inconnue'}`);
+  const url = body.choices?.[0]?.message?.images?.[0]?.image_url?.url ?? '';
+  const match = /^data:image\/[a-z+]+;base64,(.+)$/s.exec(url);
+  if (!match) throw new Error('Le modèle n’a renvoyé aucune image. Relancez.');
+  return {
+    data: Buffer.from(match[1], 'base64'),
+    usage: {
+      model: body.model ?? opts.model,
+      inputTokens: body.usage?.prompt_tokens ?? 0,
+      outputTokens: body.usage?.completion_tokens ?? 0,
+      costUsd: Math.round((body.usage?.cost ?? 0) * 10000) / 10000,
+    },
+  };
+};
+
+/** Réponse texte courte (conversations) : appel sans streaming. */
+export const openrouterChat = async (opts: {
+  model: string;
+  system: string;
+  messages: { role: 'user' | 'assistant'; content: string }[];
+  maxTokens: number;
+}): Promise<{ text: string; usage: DesignUsage }> => {
+  if (!config.openrouterApiKey) throw new Error('Clé API OpenRouter absente (OPENROUTER_API_KEY dans backend/.env).');
+  const res = await fetch(ENDPOINT, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.openrouterApiKey}`, 'Content-Type': 'application/json', 'X-Title': 'Cockpit' },
+    body: JSON.stringify({
+      model: opts.model,
+      max_tokens: opts.maxTokens,
+      reasoning: { exclude: true },
+      messages: [{ role: 'system', content: opts.system }, ...opts.messages],
+    }),
+    signal: AbortSignal.timeout(3 * 60 * 1000),
+  }).catch((err: unknown) => {
+    throw new Error(`Impossible de joindre l’API OpenRouter (${err instanceof Error ? err.message : 'erreur réseau'}).`);
+  });
+  if (!res.ok) throw new Error(await httpError(res));
+  const body = (await res.json()) as {
+    model?: string;
+    error?: { message?: string };
+    choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
+    usage?: Usage;
+  };
+  if (body.error) throw new Error(`Erreur de l’API OpenRouter : ${body.error.message ?? 'inconnue'}`);
+  const choice = body.choices?.[0];
+  const text = choice?.message?.content?.trim() ?? '';
+  if (!text) throw new Error(choice?.finish_reason === 'length' ? 'Réponse trop longue, tronquée.' : 'Réponse vide de l’agent.');
+  return {
+    text,
+    usage: {
+      model: body.model ?? opts.model,
+      inputTokens: body.usage?.prompt_tokens ?? 0,
+      outputTokens: body.usage?.completion_tokens ?? 0,
+      costUsd: Math.round((body.usage?.cost ?? 0) * 10000) / 10000,
+    },
+  };
 };
 
 /** Appel en streaming (évite les coupures sur les longues générations), réponse JSON validée par `schema`. */

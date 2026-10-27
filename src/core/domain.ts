@@ -9,12 +9,23 @@ import type {
   Activity,
   Agent,
   AgentInput,
+  AgentMemoryEntry,
+  AgentMemoryInput,
   Conversation,
   NewConversationInput,
   AppNotification,
   ChatMessage,
+  Content,
   ContentAction,
+  ContentUpdate,
+  EditorialIdea,
+  EditorialPlan,
   MeetingStatus,
+  Network,
+  PostIdea,
+  Project,
+  PublicationResult,
+  UploadedFile,
   NewIdeaInput,
   NewMeetingInput,
   DesignResult,
@@ -30,6 +41,7 @@ import type {
   NewTaskInput,
   Restaurant,
   Settings,
+  SiteTask,
   StripeStatus,
   Task,
   TaskStatus,
@@ -38,9 +50,10 @@ import type {
 } from './types';
 import { createSeed, DEFAULT_STEP_AGENTS, simulatedReplies, standardTests, type Seed } from './mocks';
 import { dayjs, nowIso, rel, uid } from './dates';
-import { formatAddress, stepMeta } from './labels';
+import { formatAddress, networkLabel, stepMeta } from './labels';
 import { buildWorkflow, openingStatus, REPO_NAME_RE, repoNameOf, siteSlug } from './workflow';
 import { paths, RESTAURANT_PROJECT } from './paths';
+import { defaultModels, sameModels, specialtyOf } from './specialties';
 
 /** Base de données complète, telle que servie par `GET /api/bootstrap`. */
 export type Db = Seed & { typing: Record<string, boolean> };
@@ -177,6 +190,7 @@ export const regenerateDesign = ({ db }: DomainContext, draftId: string, request
   });
   const version = newVersion(draft.versions.length + 1, feedback, fresh);
   draft.versions.push(version);
+  if (feedback) rememberFeedback(db, 'design', draft, feedback);
   draft.updatedAt = nowIso();
   return { draft, version };
 };
@@ -274,6 +288,7 @@ export const requestBuildChanges = ({ db }: DomainContext, draftId: string, feed
   });
   const build = newBuild(draft, last.designVersionId, remark);
   draft.builds.push(build);
+  if (remark) rememberFeedback(db, 'development', draft, remark);
   draft.updatedAt = nowIso();
   return { draft, build };
 };
@@ -655,7 +670,8 @@ export const addIdea = ({ db }: DomainContext, input: NewIdeaInput) => {
     status: 'idea',
     scheduledAt: input.scheduledAt,
     projectId: input.projectId,
-    agentId: 'agent-com',
+    // L'agent du planning des posts crée le post (Lina par défaut).
+    agentId: editorialPlanOf(project).agentId,
     captions: {},
     generations: 0,
     history: [{ date: nowIso(), text: 'Idée créée' }],
@@ -671,26 +687,29 @@ const allowedContentActions: Record<ContentAction, string[]> = {
   another_idea: ['topic_review'],
   validate_visual: ['visual_review'],
   request_changes: ['visual_review'],
-  simulate_error: ['scheduled', 'approved'],
+  publish_now: ['scheduled'],
   retry: ['error'],
 };
 
+/**
+ * Circuit d'un post : idée → l'agent le crée (textes + image) → je valide ou demande une modification →
+ * programmé → publié à la date choisie. Côté API, la création et la publication réelles sont lancées par
+ * `backend/src/social.ts` ; en mode démo, `ctx.schedule` les simule.
+ */
 export const contentAction = (ctx: DomainContext, contentId: string, action: ContentAction, comment?: string) => {
   const { db, schedule } = ctx;
   const c = find(db.contents, contentId, 'Contenu');
   if (!allowedContentActions[action].includes(c.status)) throw new DomainError(`Action « ${action} » impossible au statut « ${c.status} ».`, 409);
   const log = (text: string) => c.history.push({ date: nowIso(), text });
+  const agentName = db.agents.find((a) => a.id === c.agentId)?.name ?? 'L’agent';
 
   switch (action) {
     case 'submit_topic':
-      c.status = 'topic_review';
-      pushNotification(db, { type: 'validation', title: 'Sujet à valider', body: c.title, link: paths.content(c.projectId, c.id) });
-      break;
     case 'validate_topic':
       c.status = 'preparing';
-      log('Sujet validé');
+      c.generationError = undefined;
+      log(`Création du post demandée à ${agentName}`);
       openLinkedTasks(db, (t) => t.ref?.type === 'content' && t.ref.contentId === contentId).forEach((t) => (t.status = 'done'));
-      pushActivity(db, { type: 'validated', actor: 'me', text: `a validé le sujet « ${c.title} »`, link: paths.content(c.projectId, c.id) });
       schedule(1800, (d) => generateVisual(d, contentId));
       break;
     case 'another_idea': {
@@ -703,55 +722,159 @@ export const contentAction = (ctx: DomainContext, contentId: string, action: Con
     }
     case 'validate_visual':
       c.status = 'scheduled';
-      c.scheduledAt = rel(1, 9);
-      log('Visuel validé — programmé pour demain 09:00');
-      pushActivity(db, { type: 'validated', actor: 'me', text: `a validé le visuel « ${c.title} » — programmé pour demain`, link: paths.content(c.projectId, c.id) });
+      // Une date déjà passée : publication dans quelques minutes.
+      if (dayjs(c.scheduledAt).isBefore(dayjs())) c.scheduledAt = dayjs().add(5, 'minute').toISOString();
+      log(`Post validé — publication prévue le ${dayjs(c.scheduledAt).format('D MMM à HH:mm')}`);
+      pushActivity(db, { type: 'validated', actor: 'me', text: `a validé le post « ${c.title} »`, link: paths.content(c.projectId, c.id) });
       break;
-    case 'request_changes':
+    case 'request_changes': {
+      const remark = comment?.trim();
+      if (!remark) throw new DomainError('Indiquez la modification attendue pour que l’agent corrige le post.');
       c.status = 'preparing';
-      log('Modification du visuel demandée');
-      schedule(1800, (d) => {
-        const x = d.contents.find((y) => y.id === contentId);
-        if (!x || x.status !== 'preparing') return;
-        x.status = 'visual_review';
-        x.generations += 1;
-        x.history.push({ date: nowIso(), text: `Nouvelle version générée (génération n° ${x.generations})` });
-      });
+      c.generationError = undefined;
+      log(`Modification demandée : ${remark}`);
+      // L'agent retient la remarque pour ses prochains posts.
+      const project = db.projects.find((p) => p.id === c.projectId);
+      if (db.agents.some((a) => a.id === c.agentId))
+        pushMemory(db, c.agentId, { text: `${project?.name ?? 'Projet'} — remarque du studio sur un post (« ${c.title} ») : ${remark}`, source: 'project', sourceId: c.id, projectId: c.projectId });
+      schedule(1800, (d) => generateVisual(d, contentId));
+      return c;
+    }
+    case 'publish_now':
+      c.scheduledAt = nowIso();
+      log('Publication immédiate demandée');
+      schedule(2000, (d) => simulatePublication(d, contentId));
       break;
     case 'retry':
       c.status = 'scheduled';
       c.errorMessage = undefined;
-      log('Nouvelle tentative de publication lancée');
-      schedule(2000, (d) => {
-        const x = d.contents.find((y) => y.id === contentId);
-        if (!x || x.status !== 'scheduled') return;
-        x.status = 'published';
-        x.history.push({ date: nowIso(), text: 'Publié avec succès (simulation)' });
-        pushActivity(d, { type: 'agent_done', actor: 'agent-com', text: `a publié « ${x.title} » après nouvelle tentative`, link: paths.content(x.projectId, x.id) });
-      });
-      break;
-    case 'simulate_error':
-      c.status = 'error';
-      c.errorMessage = 'Publication refusée par le réseau (simulation) : jeton d’accès expiré.';
-      log('Échec de publication (simulé)');
-      pushNotification(db, { type: 'alert', title: 'Publication en erreur', body: c.title, link: paths.content(c.projectId, c.id) });
+      log('Nouvelle tentative de publication');
+      schedule(2000, (d) => simulatePublication(d, contentId));
       break;
   }
   if (comment) log(`Commentaire : ${comment}`);
   return c;
 };
 
-/** Effet différé : l'agent communication « génère » le visuel après validation du sujet. */
+/** Retouche des textes ou de la date avant publication. */
+export const updateContent = ({ db }: DomainContext, contentId: string, patch: ContentUpdate) => {
+  const c = find(db.contents, contentId, 'Contenu');
+  if (!['idea', 'visual_review', 'scheduled', 'error'].includes(c.status)) throw new DomainError('Ce post ne peut plus être modifié.', 409);
+  if (patch.captions)
+    c.networks.forEach((n) => {
+      const text = patch.captions?.[n];
+      if (text !== undefined) c.captions[n] = text.trim();
+    });
+  if (patch.scheduledAt) c.scheduledAt = patch.scheduledAt;
+  if (patch.title?.trim()) c.title = patch.title.trim();
+  if (patch.objective !== undefined) c.objective = patch.objective.trim();
+  if (patch.networks) {
+    if (!patch.networks.length) throw new DomainError('Choisissez au moins un réseau.');
+    c.networks = patch.networks;
+  }
+  const changes = [
+    patch.title || patch.objective !== undefined ? 'sujet' : null,
+    patch.networks ? `réseaux (${c.networks.map((n) => networkLabel[n]).join(', ')})` : null,
+    patch.captions ? 'textes' : null,
+    patch.scheduledAt ? `date (${dayjs(c.scheduledAt).format('D MMM à HH:mm')})` : null,
+  ].filter(Boolean);
+  c.history.push({ date: nowIso(), text: `Modifié : ${changes.join(', ') || 'aucun changement'}` });
+  return c;
+};
+
+/** Supprime un post du cockpit (idée, post à valider, programmé…). Un post déjà publié reste en ligne sur les réseaux. */
+export const deleteContent = ({ db }: DomainContext, contentId: string) => {
+  const c = find(db.contents, contentId, 'Contenu');
+  if (c.status === 'publishing') throw new DomainError('Publication en cours : attendez la fin avant de supprimer ce post.', 409);
+  if (c.status === 'preparing') throw new DomainError('L’agent est en train de créer ce post : attendez la fin avant de le supprimer.', 409);
+  db.contents = db.contents.filter((x) => x.id !== contentId);
+  // La piste d'origine redevient disponible ; la discussion éditoriale ne référence plus le post.
+  db.projects.forEach((p) =>
+    p.ideas?.forEach((i) => {
+      if (i.contentId === contentId) Object.assign(i, { status: 'kept', contentId: undefined });
+    }),
+  );
+  db.conversations.forEach((conv) => {
+    if (conv.editorial) conv.editorial.contentIds = conv.editorial.contentIds.filter((id) => id !== contentId);
+  });
+  pushActivity(db, { type: 'task', actor: 'me', text: `a supprimé le post « ${c.title} »`, link: paths.communication(c.projectId) });
+  return { deleted: true, projectId: c.projectId };
+};
+
+/** L'agent a créé (ou recréé) le post : il attend ma validation. */
+export const completePost = (db: Db, contentId: string, result: { captions: Partial<Record<Network, string>>; image?: UploadedFile; imageAlt?: string; note: string }) => {
+  const c = db.contents.find((x) => x.id === contentId);
+  if (!c || c.status !== 'preparing') return;
+  c.captions = { ...c.captions, ...result.captions };
+  if (result.image) {
+    c.image = result.image;
+    c.imageAlt = result.imageAlt;
+  }
+  c.status = 'visual_review';
+  c.generations += 1;
+  c.generationError = undefined;
+  c.history.push({ date: nowIso(), text: result.note });
+  pushNotification(db, { type: 'validation', title: 'Post à valider', body: c.title, link: paths.content(c.projectId, c.id) });
+};
+
+/** Création impossible : le post revient à l'état précédent avec l'erreur. */
+export const failPost = (db: Db, contentId: string, error: string) => {
+  const c = db.contents.find((x) => x.id === contentId);
+  if (!c || c.status !== 'preparing') return;
+  c.status = c.generations ? 'visual_review' : 'idea';
+  c.generationError = error;
+  c.history.push({ date: nowIso(), text: `Création du post échouée : ${error}` });
+  pushNotification(db, { type: 'alert', title: 'Création du post échouée', body: `${c.title} — ${error}`, link: paths.content(c.projectId, c.id) });
+};
+
+/** Posts programmés dont l'heure est venue. */
+export const duePosts = (db: Db, now = dayjs()) => db.contents.filter((c) => c.status === 'scheduled' && !dayjs(c.scheduledAt).isAfter(now));
+
+/** Réseaux restant à publier : ceux qui n'ont pas déjà réussi (une nouvelle tentative ne republie pas un réseau réussi). */
+export const pendingNetworks = (c: Content) => c.networks.filter((n) => c.publications?.[n]?.status !== 'published');
+
+export const startPublishing = (db: Db, contentId: string) => {
+  const c = db.contents.find((x) => x.id === contentId);
+  if (!c || c.status !== 'scheduled') return false;
+  c.status = 'publishing';
+  return true;
+};
+
+/** Résultats de la publication : publié si tous les réseaux ont réussi, sinon erreur (les réussis sont conservés). */
+export const recordPublications = (db: Db, contentId: string, results: Partial<Record<Network, PublicationResult>>) => {
+  const c = db.contents.find((x) => x.id === contentId);
+  if (!c) return;
+  c.publications = { ...c.publications, ...results };
+  const failed = c.networks.filter((n) => c.publications?.[n]?.status !== 'published');
+  if (!failed.length) {
+    c.status = 'published';
+    c.errorMessage = undefined;
+    c.history.push({ date: nowIso(), text: `Publié sur ${c.networks.map((n) => networkLabel[n]).join(', ')}` });
+    pushActivity(db, { type: 'agent_done', actor: c.agentId, text: `a publié « ${c.title} »`, link: paths.content(c.projectId, c.id) });
+    return;
+  }
+  c.status = 'error';
+  c.errorMessage = failed.map((n) => `${networkLabel[n]} : ${c.publications?.[n]?.error ?? 'échec'}`).join(' · ');
+  c.history.push({ date: nowIso(), text: `Échec de publication — ${c.errorMessage}` });
+  pushNotification(db, { type: 'alert', title: 'Publication en erreur', body: `${c.title} — ${c.errorMessage}`, link: paths.content(c.projectId, c.id) });
+};
+
+/** Mode démo : publication simulée sur tous les réseaux. */
+const simulatePublication = (db: Db, contentId: string) => {
+  if (!startPublishing(db, contentId)) return;
+  const c = db.contents.find((x) => x.id === contentId)!;
+  recordPublications(db, contentId, Object.fromEntries(pendingNetworks(c).map((n) => [n, { status: 'published', at: nowIso() }])));
+};
+
+/** Mode démo : l'agent « crée » le post après un court délai. */
 const generateVisual = (db: Db, contentId: string) => {
   const c = db.contents.find((x) => x.id === contentId);
   if (!c || c.status !== 'preparing') return;
-  c.status = 'visual_review';
-  c.generations += 1;
   const imageNetworks = c.networks.filter((n): n is 'instagram' | 'linkedin' | 'facebook' => n !== 'tiktok');
   if (imageNetworks.length && !c.masterVisual)
     c.masterVisual = {
       title: `Visuel maître — « ${c.title} »`,
-      description: 'Proposition générée (simulation) à partir du sujet validé.',
+      description: 'Proposition générée (simulation) à partir du sujet.',
       palette: ['#3B4A9E', '#F2EDE4', '#5E9C7D'],
       adaptations: imageNetworks.map((network) => ({
         network,
@@ -759,14 +882,221 @@ const generateVisual = (db: Db, contentId: string) => {
         note: 'Déclinaison automatique du visuel maître',
       })),
     };
-  if (c.networks.includes('tiktok') && !c.video)
-    c.video = { title: 'Vidéo verticale 9:16 — 20 s', duration: '0:20', script: ['Accroche 0–3 s', 'Démonstration 3–15 s', 'Appel à l’action 15–20 s'] };
-  c.networks.forEach((n) => {
-    c.captions[n] ??= `Proposition de texte pour ${n} (simulation) : ${c.title}.`;
+  completePost(db, contentId, {
+    captions: Object.fromEntries(c.networks.map((n) => [n, c.captions[n] ?? `Proposition de texte pour ${networkLabel[n]} (simulation) : ${c.title}.`])),
+    note: 'Post créé (simulation)',
   });
-  c.history.push({ date: nowIso(), text: c.video ? 'Vidéo générée (simulation)' : 'Visuel maître et déclinaisons générés (simulation)' });
-  pushNotification(db, { type: 'validation', title: 'Visuel à valider', body: c.title, link: paths.content(c.projectId, c.id) });
 };
+
+/* ---------- Planning éditorial : discussion du lundi, puis posts de la semaine ---------- */
+
+/** Réseaux disponibles pour les posts (TikTok viendra avec la génération de vidéos). */
+export const POST_NETWORKS: Network[] = ['instagram', 'facebook', 'linkedin'];
+
+export const defaultEditorialPlan = (): EditorialPlan => ({
+  enabled: false,
+  days: [2, 5],
+  time: '11:00',
+  networks: [...POST_NETWORKS],
+  agentId: 'agent-com',
+  briefDay: 1,
+  briefTime: '09:00',
+  lastBriefWeek: null,
+});
+
+export const editorialPlanOf = (p: Project): EditorialPlan => ({ ...defaultEditorialPlan(), ...p.editorial });
+
+const atTime = (day: ReturnType<typeof dayjs>, time: string) => {
+  const [h, m] = time.split(':').map(Number);
+  return day.hour(h || 0).minute(m || 0).second(0).millisecond(0);
+};
+
+/** Lundi de la semaine (clé de semaine, AAAA-MM-JJ). */
+export const weekKey = (d = dayjs()) => d.startOf('isoWeek').format('YYYY-MM-DD');
+
+/** Dates de publication de la semaine, d'après le planning. */
+export const weekSlots = (plan: EditorialPlan, week = dayjs().startOf('isoWeek')) =>
+  [...plan.days].sort((a, b) => a - b).map((d) => atTime(week.isoWeekday(d), plan.time).toISOString());
+
+export const updateEditorialPlan = ({ db }: DomainContext, projectId: string, patch: Partial<EditorialPlan>) => {
+  const p = find(db.projects, projectId, 'Projet');
+  if (patch.agentId) find(db.agents, patch.agentId, 'Agent');
+  if (patch.days && (!patch.days.length || patch.days.some((d) => d < 1 || d > 7))) throw new DomainError('Choisissez au moins un jour de publication.');
+  if (patch.networks && !patch.networks.length) throw new DomainError('Choisissez au moins un réseau.');
+  p.editorial = { ...editorialPlanOf(p), ...patch };
+  return p.editorial;
+};
+
+/** Projets dont la discussion de la semaine doit s'ouvrir (jour et heure atteints, pas encore ouverte cette semaine). */
+export const dueBriefs = (db: Db, now = dayjs()) =>
+  db.projects.filter((p) => {
+    const plan = editorialPlanOf(p);
+    if (!plan.enabled || plan.lastBriefWeek === weekKey(now)) return false;
+    return !now.isBefore(atTime(now.startOf('isoWeek').isoWeekday(plan.briefDay), plan.briefTime));
+  });
+
+/** Ouvre la discussion de la semaine avec l'agent du planning ; il propose ensuite les idées (API) ou une réponse simulée (démo). */
+export const openEditorialConversation = (db: Db, projectId: string, now = dayjs()) => {
+  const p = find(db.projects, projectId, 'Projet');
+  const plan = editorialPlanOf(p);
+  const agent = find(db.agents, plan.agentId, 'Agent');
+  const week = now.startOf('isoWeek');
+  // Les dates déjà passées (discussion lancée en fin de semaine) partent sur la semaine suivante.
+  const slots = weekSlots(plan, week).filter((s) => dayjs(s).isAfter(now));
+  const finalSlots = slots.length ? slots : weekSlots(plan, week.add(1, 'week'));
+  const conv: Conversation = {
+    id: uid('conv'),
+    agentId: agent.id,
+    projectId: p.id,
+    title: `Posts de la semaine du ${dayjs(finalSlots[0]).startOf('isoWeek').format('D MMMM')}`,
+    messages: [
+      {
+        id: uid('msg'),
+        from: 'system',
+        text: `Discussion éditoriale avec ${agent.name} : ${finalSlots.length} post(s) à préparer (${finalSlots.map((s) => dayjs(s).format('dddd D à HH:mm')).join(', ')}) sur ${plan.networks.map((n) => networkLabel[n]).join(', ')}. Quand vous êtes d’accord sur les idées, cliquez sur « Valider les idées ».`,
+        date: nowIso(),
+      },
+    ],
+    suggestions: ['Propose-moi d’autres idées', 'On garde la première idée', 'Quel ton pour cette semaine ?'],
+    editorial: { week: weekKey(dayjs(finalSlots[0])), slots: finalSlots, networks: [...plan.networks], contentIds: [] },
+  };
+  db.conversations.unshift(conv);
+  p.editorial = { ...plan, lastBriefWeek: weekKey(now) };
+  db.typing[conv.id] = true;
+  pushNotification(db, { type: 'validation', title: `${agent.name} vous propose les posts de la semaine`, body: p.name, link: paths.discussions(conv.id, p.id) });
+  return conv;
+};
+
+/** Idées validées dans la discussion : un post par idée, que l'agent crée aussitôt. */
+export const confirmEditorialIdeas = (ctx: DomainContext, conversationId: string, ideas: EditorialIdea[]) => {
+  const { db, schedule } = ctx;
+  const conv = find(db.conversations, conversationId, 'Conversation');
+  if (!conv.editorial) throw new DomainError('Cette discussion n’est pas une discussion éditoriale.', 409);
+  if (conv.editorial.confirmedAt) throw new DomainError('Les idées de cette discussion ont déjà été validées.', 409);
+  if (!ideas.length) throw new DomainError('Aucune idée à valider.');
+  const created = ideas.map((idea) => {
+    const content: Content = {
+      id: uid('content'),
+      title: idea.title.trim(),
+      objective: idea.objective.trim(),
+      origin: { type: 'discussion', label: `Idée retenue lors de la discussion « ${conv.title} ».` },
+      networks: [...conv.editorial!.networks],
+      format: 'image',
+      status: 'preparing',
+      scheduledAt: idea.scheduledAt,
+      projectId: conv.projectId,
+      agentId: conv.agentId,
+      captions: {},
+      generations: 0,
+      history: [{ date: nowIso(), text: `Idée validée en discussion, création demandée` }],
+    };
+    db.contents.unshift(content);
+    schedule(1800, (d) => generateVisual(d, content.id));
+    return content;
+  });
+  conv.editorial.confirmedAt = nowIso();
+  conv.editorial.contentIds = created.map((c) => c.id);
+  conv.messages.push({
+    id: uid('msg'),
+    from: 'system',
+    text: `Idées validées : ${created.map((c) => `« ${c.title} » (${dayjs(c.scheduledAt).format('dddd D')})`).join(', ')}. Les posts sont en cours de création, vous serez prévenu pour les valider.`,
+    date: nowIso(),
+  });
+  return created;
+};
+
+/** Mode démo : idées tirées des derniers messages de l'agent. */
+export const placeholderIdeas = (conv: Conversation): EditorialIdea[] =>
+  (conv.editorial?.slots ?? []).map((scheduledAt, i) => ({ title: `Idée ${i + 1} de la discussion`, objective: '', scheduledAt }));
+
+/* ---------- Pistes de posts proposées par l'agent ---------- */
+
+/** Ajoute des pistes (sans doublon de titre avec les pistes existantes, même écartées). */
+export const addPostIdeas = (db: Db, projectId: string, ideas: { title: string; reason: string }[], source: PostIdea['source'] = 'agent', conversationId?: string) => {
+  const p = find(db.projects, projectId, 'Projet');
+  p.ideas ??= [];
+  const known = new Set(p.ideas.map((i) => i.title.trim().toLowerCase()));
+  const added = ideas
+    .filter((i) => i.title.trim() && !known.has(i.title.trim().toLowerCase()))
+    .map((i): PostIdea => ({ id: uid('idea'), title: i.title.trim(), reason: i.reason.trim(), status: 'proposed', source, createdAt: nowIso(), conversationId }));
+  p.ideas.unshift(...added);
+  return added;
+};
+
+/** Supprime une piste (ex. : relevée par erreur), sans rien apprendre à l'agent, contrairement à « Écarter ». */
+export const deletePostIdea = ({ db }: DomainContext, projectId: string, ideaId: string) => {
+  const p = find(db.projects, projectId, 'Projet');
+  find(p.ideas ?? [], ideaId, 'Piste');
+  p.ideas = (p.ideas ?? []).filter((i) => i.id !== ideaId);
+  return { deleted: true };
+};
+
+/** Rattache une piste à la discussion où elle a été proposée. */
+export const linkPostIdea = ({ db }: DomainContext, projectId: string, ideaId: string, conversationId: string) => {
+  const idea = find(find(db.projects, projectId, 'Projet').ideas ?? [], ideaId, 'Piste');
+  idea.conversationId = find(db.conversations, conversationId, 'Conversation').id;
+  return idea;
+};
+
+/** Retenir (en réserve pour une prochaine fois) ou écarter (l'agent ne la reproposera pas). */
+export const setPostIdeaStatus = ({ db }: DomainContext, projectId: string, ideaId: string, status: 'proposed' | 'kept' | 'dismissed') => {
+  const idea = find(find(db.projects, projectId, 'Projet').ideas ?? [], ideaId, 'Piste');
+  idea.status = status;
+  return idea;
+};
+
+/** Valider une piste : elle devient un post à la date choisie, que l'agent du planning crée aussitôt. */
+export const validatePostIdea = (ctx: DomainContext, projectId: string, ideaId: string, scheduledAt: ISODate) => {
+  const { db, schedule } = ctx;
+  const p = find(db.projects, projectId, 'Projet');
+  const idea = find(p.ideas ?? [], ideaId, 'Piste');
+  if (idea.status === 'validated') throw new DomainError('Cette piste est déjà devenue un post.', 409);
+  const plan = editorialPlanOf(p);
+  const content: Content = {
+    id: uid('content'),
+    title: idea.title,
+    objective: idea.reason,
+    origin: { type: 'underexplored', label: `Piste proposée par l’agent : ${idea.reason}` },
+    networks: [...plan.networks],
+    format: 'image',
+    status: 'preparing',
+    scheduledAt,
+    projectId: p.id,
+    agentId: plan.agentId,
+    captions: {},
+    generations: 0,
+    history: [{ date: nowIso(), text: 'Piste validée, création demandée' }],
+  };
+  db.contents.unshift(content);
+  idea.status = 'validated';
+  idea.contentId = content.id;
+  schedule(1800, (d) => generateVisual(d, content.id));
+  return content;
+};
+
+/** Pistes à donner à l'agent : celles en réserve à reproposer, celles écartées à éviter. */
+export const ideaContext = (p: Project) => {
+  const ideas = p.ideas ?? [];
+  const kept = ideas.filter((i) => i.status === 'kept').map((i) => `- ${i.title}`);
+  const dismissed = ideas.filter((i) => i.status === 'dismissed').map((i) => `- ${i.title}`);
+  return [kept.length && `Pistes mises en réserve par le studio (à reproposer si elles conviennent) :\n${kept.join('\n')}`, dismissed.length && `Pistes écartées par le studio (ne pas les reproposer) :\n${dismissed.join('\n')}`]
+    .filter(Boolean)
+    .join('\n');
+};
+
+/** Dates de publication à venir (cette semaine et la suivante), pour placer une piste validée. */
+export const upcomingSlots = (p: Project, now = dayjs()) => {
+  const plan = editorialPlanOf(p);
+  const week = now.startOf('isoWeek');
+  return [...weekSlots(plan, week), ...weekSlots(plan, week.add(1, 'week'))].filter((s) => dayjs(s).isAfter(now));
+};
+
+/** Mode démo : pistes fictives. */
+export const placeholderPostIdeas = () => [
+  { title: 'Les coulisses d’un restaurant partenaire', reason: 'Format qui humanise la marque (simulation)' },
+  { title: 'Avant / après : un menu passé en ligne', reason: 'Montre concrètement le résultat (simulation)' },
+  { title: '3 erreurs à éviter sur son site de restaurant', reason: 'Conseil utile, très partagé (simulation)' },
+];
 
 /* ---------- Réunions ---------- */
 
@@ -807,7 +1137,7 @@ export const sendMeetingMessage = ({ db, schedule }: DomainContext, meetingId: s
     m.transcript.push(openingEntry(db, m.agenda));
   }
   m.transcript.push({ id: uid('tr'), speaker: 'me', time: dayjs().format('HH:mm'), text });
-  const speakers = m.agentIds.filter((id) => db.agents.find((a) => a.id === id)?.enabled);
+  const speakers = m.agentIds.filter((id) => db.agents.some((a) => a.id === id));
   if (!speakers.length) return m;
   db.typing[meetingId] = true;
   speakers.forEach((agentId, i) =>
@@ -896,34 +1226,66 @@ export const toggleProjectSetting = ({ db }: DomainContext, projectId: string, k
   return p;
 };
 
-/* ---------- Conversations (réponses simulées, aucune IA connectée) ---------- */
+/* ---------- Conversations (modèle « conversations » de l'agent côté API, réponses simulées en mode démo) ---------- */
 
 export const createConversation = ({ db }: DomainContext, input: NewConversationInput): Conversation => {
   const agent = find(db.agents, input.agentId, 'Agent');
   const project = find(db.projects, input.projectId, 'Projet');
   const existing = db.conversations.find((c) => c.agentId === agent.id && c.projectId === project.id);
-  if (existing) return existing;
+  if (existing && !input.fresh) return existing;
   const conv: Conversation = {
     id: uid('conv'),
     agentId: agent.id,
     projectId: project.id,
-    title: project.name,
-    messages: [{ id: uid('msg'), from: 'system', text: `Nouvelle discussion avec ${agent.name} sur le projet ${project.name}. Réponses simulées.`, date: nowIso() }],
+    title: existing ? `${project.name} — ${dayjs().format('D MMM HH:mm')}` : project.name,
+    messages: [
+      {
+        id: uid('msg'),
+        from: 'system',
+        text: `Nouvelle discussion avec ${agent.name} sur le projet ${project.name}.${existing ? ' Ses souvenirs restent disponibles.' : ''}`,
+        date: nowIso(),
+      },
+    ],
     suggestions: ['Où en est le projet ?', 'Qu’est-ce qui attend ma validation ?', 'Propose les prochaines étapes'],
   };
   db.conversations.unshift(conv);
   return conv;
 };
 
-export const sendMessage = ({ db, schedule }: DomainContext, conversationId: string, text: string, attachment?: ChatMessage['attachment']) => {
+/** Messages récents envoyés au modèle de conversation : au-delà, l'agent ne voit plus les plus anciens. */
+export const CHAT_HISTORY_LIMIT = 40;
+
+/** Remplissage du contexte d'une discussion (messages échangés, hors messages système). */
+export const conversationContext = (c: Conversation) => {
+  const used = c.messages.filter((m) => m.from !== 'system').length;
+  return { used, limit: CHAT_HISTORY_LIMIT, ratio: Math.min(used / CHAT_HISTORY_LIMIT, 1), full: used >= CHAT_HISTORY_LIMIT };
+};
+
+/** Ajoute mon message ; l'agent est alors marqué « en train d'écrire » jusqu'à sa réponse. */
+export const postUserMessage = (db: Db, conversationId: string, text: string, attachment?: ChatMessage['attachment']) => {
   const c = find(db.conversations, conversationId, 'Conversation');
   const message: ChatMessage = { id: uid('msg'), from: 'me', text, date: nowIso(), attachment };
   c.messages.push(message);
-  if (!db.agents.find((a) => a.id === c.agentId)?.enabled) {
-    c.messages.push({ id: uid('msg'), from: 'system', text: 'Cet agent est désactivé : il ne répondra pas. Réactivez-le depuis la page Agents.', date: nowIso() });
-    return message;
-  }
   db.typing[conversationId] = true;
+  return message;
+};
+
+/** Réponse de l'agent (générée par son modèle de conversation). La conversation a pu être supprimée entre-temps. */
+export const pushAgentReply = (db: Db, conversationId: string, text: string) => {
+  const conv = db.conversations.find((x) => x.id === conversationId);
+  db.typing[conversationId] = false;
+  conv?.messages.push({ id: uid('msg'), from: 'agent', text, date: nowIso() });
+};
+
+export const failAgentReply = (db: Db, conversationId: string, error: string) => {
+  const conv = db.conversations.find((x) => x.id === conversationId);
+  db.typing[conversationId] = false;
+  conv?.messages.push({ id: uid('msg'), from: 'system', text: `L’agent n’a pas pu répondre : ${error}`, date: nowIso() });
+};
+
+/** Mode démo : réponse simulée après un court délai. */
+export const sendMessage = ({ db, schedule }: DomainContext, conversationId: string, text: string, attachment?: ChatMessage['attachment']) => {
+  const message = postUserMessage(db, conversationId, text, attachment);
   schedule(1400, (d) => {
     const conv = d.conversations.find((x) => x.id === conversationId);
     if (!conv) return;
@@ -955,18 +1317,44 @@ export const toggleAutomation = ({ db }: DomainContext, id: string) => {
 };
 
 export const updateSettings = ({ db }: DomainContext, patch: Partial<Settings>) => {
+  if (patch.siteAgents) Object.values(patch.siteAgents).forEach((id) => find(db.agents, id, 'Agent'));
   Object.assign(db.settings, patch);
   return db.settings;
+};
+
+/** Agents du flux de création de site par défaut : ceux des étapes « Maquette » et « Développement des fonctionnalités ». */
+export const DEFAULT_SITE_AGENTS: Record<SiteTask, string> = { design: DEFAULT_STEP_AGENTS.mockup, development: DEFAULT_STEP_AGENTS.functional_dev };
+
+/** Agent qui réalise une tâche IA du flux de création de site (réglable dans Paramètres → Agents IA). */
+export const siteAgent = (db: Db, task: SiteTask): Agent | undefined => {
+  const id = db.settings.siteAgents?.[task] ?? DEFAULT_SITE_AGENTS[task];
+  return db.agents.find((a) => a.id === id);
 };
 
 /* ---------- Agents ---------- */
 
 const checkProjects = (db: Db, projectIds: string[]) => projectIds.forEach((id) => find(db.projects, id, 'Projet'));
 
+/** Complète les agents créés avant l'arrivée des spécialités, des modèles et de la mémoire. */
+export const normalizeAgent = (agent: Agent): Agent => {
+  // Champs retirés : intitulé et descriptions (doublons de la spécialité et du prompt), activation, permissions et réglages de mémoire (toujours actifs).
+  const legacy = agent as Agent & Partial<Record<'model' | 'provider' | 'role' | 'specialty' | 'description' | 'enabled' | 'permissions' | 'memory', unknown>>;
+  (['model', 'provider', 'role', 'specialty', 'description', 'enabled', 'permissions', 'memory'] as const).forEach((k) => delete legacy[k]);
+  agent.models ??= defaultModels(agent.kind);
+  agent.color ||= specialtyOf(agent.kind).color;
+  agent.memories ??= [];
+  return agent;
+};
+
 export const updateAgent = ({ db }: DomainContext, agentId: string, patch: Partial<AgentInput>) => {
-  const a = find(db.agents, agentId, 'Agent');
+  const a = normalizeAgent(find(db.agents, agentId, 'Agent'));
   if (patch.projectIds) checkProjects(db, patch.projectIds);
+  const previousKind = a.kind;
+  // Nouvelle spécialité sans modèles précisés : des modèles restés par défaut suivent la spécialité.
+  const followDefaults = patch.kind && patch.kind !== previousKind && !patch.models && sameModels(a.models, defaultModels(previousKind));
   Object.assign(a, patch);
+  if (patch.kind) a.color = specialtyOf(patch.kind).color;
+  if (followDefaults) a.models = defaultModels(a.kind);
   db.projects.forEach((p) => {
     const linked = a.projectIds.includes(p.id);
     if (linked && !p.agentIds.includes(a.id)) p.agentIds.push(a.id);
@@ -975,27 +1363,136 @@ export const updateAgent = ({ db }: DomainContext, agentId: string, patch: Parti
   return a;
 };
 
-const agentColors: Record<Agent['kind'], string> = {
-  developer: '#2F7A5B',
-  webdesign: '#A54C9E',
-  communication: '#BF7514',
-  finance: '#3FA0C8',
-  coordinator: '#3B4A9E',
-};
-
 export const createAgent = ({ db }: DomainContext, input: AgentInput): Agent => {
   checkProjects(db, input.projectIds);
   const agent: Agent = {
     id: uid('agent'),
     ...input,
-    description: input.specialty,
     availability: 'available',
     lastActivity: { date: nowIso(), text: 'Agent créé' },
     issue: null,
-    color: agentColors[input.kind],
+    color: specialtyOf(input.kind).color,
+    models: input.models ?? defaultModels(input.kind),
+    memories: [],
   };
   db.agents.push(agent);
   db.projects.filter((p) => input.projectIds.includes(p.id)).forEach((p) => p.agentIds.push(agent.id));
   pushActivity(db, { type: 'task', actor: 'me', text: `a créé l’agent ${agent.name}`, link: paths.agents(agent.id) });
   return agent;
 };
+
+const agentOrThrow = (db: Db, agentId: string) => normalizeAgent(find(db.agents, agentId, 'Agent'));
+
+/** Souvenirs ajoutés au prompt d'un appel : le contexte d'entrée reste court (quelques centaines de tokens). */
+export const MEMORY_CONTEXT_LIMIT = 6;
+/** Longueur maximale d'un souvenir. */
+export const MEMORY_MAX_LENGTH = 400;
+/** Souvenirs conservés par agent : au-delà, les plus anciens souvenirs automatiques sont oubliés (jamais ceux saisis à la main). */
+const MEMORY_MAX_ENTRIES = 200;
+
+/** Deux souvenirs disent la même chose s'ils partagent au moins 80 % de leurs mots significatifs. */
+const sameMemory = (a: string, b: string) => {
+  const wa = new Set(normalizeWords(a));
+  const wb = new Set(normalizeWords(b));
+  if (!wa.size || !wb.size) return a.trim().toLowerCase() === b.trim().toLowerCase();
+  const common = [...wa].filter((w) => wb.has(w)).length;
+  return common / Math.min(wa.size, wb.size) >= 0.8;
+};
+
+/** Ajoute un souvenir ; s'il existe déjà sous une forme proche, l'ancien est simplement remonté en tête (pas de doublon). */
+const pushMemory = (db: Db, agentId: string, input: AgentMemoryInput): AgentMemoryEntry => {
+  const agent = agentOrThrow(db, agentId);
+  const text = input.text.trim().slice(0, MEMORY_MAX_LENGTH);
+  const existing = agent.memories.find((m) => sameMemory(m.text, text));
+  if (existing) {
+    agent.memories = [existing, ...agent.memories.filter((m) => m !== existing)];
+    return existing;
+  }
+  const entry: AgentMemoryEntry = { id: uid('mem'), text, source: input.source ?? 'manual', sourceId: input.sourceId ?? null, projectId: input.projectId ?? null, createdAt: nowIso() };
+  agent.memories.unshift(entry);
+  for (let i = agent.memories.length - 1; agent.memories.length > MEMORY_MAX_ENTRIES && i >= 0; i--) {
+    if (agent.memories[i].source !== 'manual') agent.memories.splice(i, 1);
+  }
+  return entry;
+};
+
+export const addAgentMemory = ({ db }: DomainContext, agentId: string, input: AgentMemoryInput): AgentMemoryEntry => pushMemory(db, agentId, input);
+
+/** Remarque de modification : l'agent chargé de la tâche la retient pour ce restaurant et ses prochains travaux. */
+const rememberFeedback = (db: Db, task: SiteTask, draft: SiteDraft, feedback: string) => {
+  const agent = siteAgent(db, task);
+  const what = task === 'design' ? 'la maquette' : 'le site';
+  if (agent) pushMemory(db, agent.id, { text: `${draft.answers.name} — remarque du studio sur ${what} : ${feedback}`, source: 'project', sourceId: draft.id, projectId: RESTAURANT_PROJECT });
+};
+
+export const updateAgentMemory = ({ db }: DomainContext, agentId: string, memoryId: string, patch: { text: string }): AgentMemoryEntry => {
+  const memory = find(agentOrThrow(db, agentId).memories, memoryId, 'Souvenir');
+  memory.text = patch.text.trim().slice(0, MEMORY_MAX_LENGTH);
+  return memory;
+};
+
+export const deleteAgentMemory = ({ db }: DomainContext, agentId: string, memoryId: string) => {
+  const agent = agentOrThrow(db, agentId);
+  const before = agent.memories.length;
+  agent.memories = agent.memories.filter((m) => m.id !== memoryId);
+  if (agent.memories.length === before) throw new DomainError(`Souvenir introuvable : ${memoryId}`, 404);
+  return { deleted: true };
+};
+
+export const listAgentMemories = ({ db }: { db: Db }, agentId: string, query = ''): AgentMemoryEntry[] => {
+  const agent = agentOrThrow(db, agentId);
+  return query.trim() ? searchAgentMemories(agent, query) : agent.memories;
+};
+
+/** Mots vides français ignorés par la recherche de souvenirs (sans accents : les mots sont comparés une fois normalisés). */
+const MEMORY_STOP_WORDS = new Set([
+  'avec', 'avoir', 'cette', 'dans', 'depuis', 'des', 'elle', 'elles', 'encore', 'etre', 'fait', 'faire', 'faut', 'les', 'leur', 'mais',
+  'mes', 'moi', 'mon', 'nous', 'pour', 'pas', 'par', 'plus', 'que', 'quel', 'qui', 'sans', 'ses', 'son', 'sont', 'sur', 'tous', 'tout',
+  'une', 'vos', 'votre', 'vous', 'aux', 'ces', 'est',
+  // Mots présents dans chaque remarque mémorisée (« … — remarque du studio sur la maquette : … »).
+  'remarque', 'studio', 'maquette', 'site', 'sites',
+]);
+
+const normalizeWords = (text: string) =>
+  text
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3 && !MEMORY_STOP_WORDS.has(w));
+
+/** Nombre de mots significatifs de la requête présents dans le texte. */
+export const sharedWords = (query: string, text: string) => {
+  const body = new Set(normalizeWords(text));
+  return [...new Set(normalizeWords(query))].filter((t) => body.has(t)).length;
+};
+
+/**
+ * Recherche par mots communs. L'API la combine à une recherche par le sens (embeddings, `backend/src/memorySearch.ts`) ;
+ * seule, elle sert au mode démo et de secours si le modèle d'embeddings est indisponible.
+ */
+/** Souvenirs utilisables sur un projet : les siens et les souvenirs généraux (sans projet). */
+export const memoriesFor = (agent: Agent, projectId?: string | null) =>
+  projectId ? agent.memories.filter((m) => !m.projectId || m.projectId === projectId) : agent.memories;
+
+export const searchAgentMemories = (agent: Agent, query: string, limit = MEMORY_CONTEXT_LIMIT, projectId?: string | null): AgentMemoryEntry[] => {
+  const pool = memoriesFor(agent, projectId);
+  if (!pool.length) return [];
+  if (!normalizeWords(query).length) return pool.slice(0, limit);
+  return pool
+    .map((memory) => ({ memory, score: sharedWords(query, memory.text) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || b.memory.createdAt.localeCompare(a.memory.createdAt))
+    .slice(0, limit)
+    .map(({ memory }) => memory);
+};
+
+/** Bloc de contexte mémoire à ajouter au prompt d'un agent. */
+export const agentMemoryBlock = (memories: AgentMemoryEntry[]): string => {
+  if (!memories.length) return '';
+  return `Mémoire de l'agent — souvenirs pertinents (ignore ceux qui ne s'appliquent pas) :\n${memories.map((m) => `- ${m.text}`).join('\n')}`;
+};
+
+/** Contexte système d'un agent : prompt + souvenirs pertinents (par défaut, recherche par mots communs). */
+export const agentSystemContext = (agent: Agent, query: string, memories = searchAgentMemories(agent, query)): string =>
+  [agent.instructions.trim(), agentMemoryBlock(memories)].filter(Boolean).join('\n\n');

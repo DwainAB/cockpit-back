@@ -19,18 +19,18 @@ export const config = {
   restaurantsRefreshMs: Number(process.env.RESTAURANTS_REFRESH_MS ?? 60_000),
   uploadsDir: path.resolve(process.env.UPLOADS_DIR ?? './data/uploads'),
   designsDir: path.resolve(process.env.DESIGNS_DIR ?? './data/designs'),
-  /** `claude` si une clé API est présente, sinon `simulated` (aucune IA appelée). */
-  designGenerator: (process.env.DESIGN_GENERATOR ?? (process.env.ANTHROPIC_API_KEY ? 'claude' : 'simulated')) as 'claude' | 'simulated',
-  designModel: process.env.DESIGN_MODEL ?? 'claude-opus-5-5',
+  /** Modèle d'embeddings de la mémoire des agents (téléchargé au premier lancement). */
+  modelsDir: path.resolve(process.env.MODELS_DIR ?? './data/models'),
+  /** Les modèles des agents se règlent dans le cockpit (page Agents) ; sans aucune clé API, la génération est simulée. */
+  designGenerator: (process.env.DESIGN_GENERATOR ?? (process.env.ANTHROPIC_API_KEY || process.env.OPENROUTER_API_KEY ? 'ai' : 'simulated')) as 'ai' | 'simulated',
   designEffort: (process.env.DESIGN_EFFORT ?? 'high') as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
   /** Nombre de maquettes générées en parallèle ; les autres restent « en attente ». */
   designConcurrency: Math.max(1, Number(process.env.DESIGN_CONCURRENCY ?? 2)),
   /** Page du restaurant sur la plateforme Yumco (boutons Commander et Réserver). */
   platformUrl: platformUrl(process.env.PLATFORM_RESTAURANT_ID ?? TEST_PLATFORM_RESTAURANT_ID, process.env.PLATFORM_BASE_URL ?? PLATFORM_BASE_URL),
+  /** Modèle d'images des posts (OpenRouter, payant à l'usage : ~0,005 $ l'image avec le modèle par défaut). */
+  imageModel: process.env.IMAGE_MODEL ?? 'google/gemini-3.1-flash-image',
   /* Agent développeur (Next.js) */
-  /** `claude` (API Anthropic) ou `openrouter` (DEV_MODEL est alors un identifiant OpenRouter). */
-  devProvider: (process.env.DEV_PROVIDER ?? 'claude') as 'claude' | 'openrouter',
-  devModel: process.env.DEV_MODEL ?? 'claude-opus-5-5',
   openrouterApiKey: process.env.OPENROUTER_API_KEY ?? '',
   devEffort: (process.env.DEV_EFFORT ?? 'high') as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
   /** Tentatives de l'agent développeur (première version + corrections après tests). */

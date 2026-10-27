@@ -5,37 +5,85 @@ export type ISODate = string;
 
 /* ---------- Agents ---------- */
 
-export type AgentKind = 'developer' | 'webdesign' | 'communication' | 'finance' | 'coordinator';
+/**
+ * Spécialité de l'agent. Chaque spécialité définit en interne le modèle à utiliser
+ * (voir `specialties.ts`) ; la liste est volontairement extensible.
+ */
+export type AgentKind =
+  | 'coordinator'
+  | 'webdesign'
+  | 'developer'
+  | 'commercial'
+  | 'marketing'
+  | 'seo'
+  | 'copywriter'
+  | 'graphist'
+  | 'communication'
+  | 'support'
+  | 'analyst'
+  | 'finance';
 export type AgentAvailability = 'available' | 'busy' | 'offline';
+export type AgentProvider = 'openrouter' | 'claude';
+
+/** Modèle IA : fournisseur + identifiant chez ce fournisseur. */
+export interface AgentModel {
+  provider: AgentProvider;
+  model: string;
+}
+
+/** Modèles d'un agent : l'un pour les tâches (maquettes, code…), l'autre pour les conversations. */
+export interface AgentModels {
+  task: AgentModel;
+  chat: AgentModel;
+}
+
+export type AgentMemorySource = 'manual' | 'conversation' | 'meeting' | 'project';
+
+/** Souvenir durable d'un agent, injecté dans son contexte par pertinence (RAG lexical). */
+export interface AgentMemoryEntry {
+  id: string;
+  text: string;
+  source: AgentMemorySource;
+  /** Élément d'origine (conversation, réunion, projet…). */
+  sourceId: string | null;
+  /** Projet où le souvenir a été appris ; absent : souvenir général, valable pour tous les projets. */
+  projectId?: string | null;
+  createdAt: ISODate;
+}
+
+export interface AgentMemoryInput {
+  text: string;
+  source?: AgentMemorySource;
+  sourceId?: string | null;
+  projectId?: string | null;
+}
 
 export interface Agent {
   id: string;
   kind: AgentKind;
   name: string;
-  role: string;
-  specialty: string;
-  description: string;
   availability: AgentAvailability;
   projectIds: string[];
   lastActivity: { date: ISODate; text: string };
   /** Problème déclaré manuellement. Les problèmes liés aux dossiers sont dérivés (voir useAgentIssues). */
   issue: string | null;
   color: string;
-  /** Configuration éditable depuis la page Agents. */
-  enabled: boolean;
+  /** Prompt de l'agent : son rôle et ses consignes permanentes. */
   instructions: string;
-  permissions: { createTasks: boolean; requireValidation: boolean };
+  /** Modèles IA : valeurs par défaut de la spécialité (voir `specialties.ts`), modifiables dans le cockpit. */
+  models: AgentModels;
+  /** Souvenirs de l'agent (voir `searchAgentMemories`). */
+  memories: AgentMemoryEntry[];
 }
 
 export interface AgentInput {
   name: string;
   kind: AgentKind;
-  role: string;
-  specialty: string;
+  /** Prompt de l'agent : son rôle et ses consignes permanentes. */
   instructions: string;
   projectIds: string[];
-  enabled: boolean;
-  permissions: { createTasks: boolean; requireValidation: boolean };
+  /** Absent : modèles par défaut de la spécialité. */
+  models?: AgentModels;
 }
 
 /** Auteur d'une action : moi, un agent (id) ou le système. */
@@ -72,6 +120,49 @@ export interface Project {
   lastActivity: { date: ISODate; text: string };
   memory: MemoryNote[];
   settings: { weeklyMeeting: boolean; requireValidation: boolean };
+  /** Planning des réseaux sociaux (absent : désactivé, valeurs par défaut). */
+  editorial?: EditorialPlan;
+  /** Pistes de posts proposées par l'agent. */
+  ideas?: PostIdea[];
+}
+
+/** Piste de post : proposée par l'agent, puis retenue (en réserve), écartée ou validée (devenue un post). */
+export interface PostIdea {
+  id: string;
+  title: string;
+  /** Pourquoi ce sujet. */
+  reason: string;
+  status: 'proposed' | 'kept' | 'dismissed' | 'validated';
+  source: 'agent' | 'discussion' | 'manual';
+  createdAt: ISODate;
+  /** Post créé à la validation. */
+  contentId?: string;
+  /** Discussion éditoriale où l'agent l'a proposée. */
+  conversationId?: string;
+}
+
+/** Planning éditorial d'un projet : jours de publication et discussion hebdomadaire avec l'agent. */
+export interface EditorialPlan {
+  enabled: boolean;
+  /** Jours de publication (1 = lundi … 7 = dimanche). */
+  days: number[];
+  /** Heure de publication (HH:mm). */
+  time: string;
+  networks: Network[];
+  /** Agent qui propose, crée et publie les posts. */
+  agentId: string;
+  /** Jour et heure où l'agent ouvre la discussion de la semaine. */
+  briefDay: number;
+  briefTime: string;
+  /** Semaine (lundi, AAAA-MM-JJ) de la dernière discussion ouverte. */
+  lastBriefWeek: string | null;
+}
+
+/** Idée de post retenue dans une discussion éditoriale. */
+export interface EditorialIdea {
+  title: string;
+  objective: string;
+  scheduledAt: ISODate;
 }
 
 /* ---------- Restaurants & production ---------- */
@@ -486,10 +577,20 @@ export type ContentStatus =
   | 'visual_review'
   | 'approved'
   | 'scheduled'
+  | 'publishing'
   | 'published'
   | 'error';
 
-export type ContentOriginType = 'meeting' | 'underexplored' | 'trend' | 'manual';
+/** Résultat de la publication d'un post sur un réseau. */
+export interface PublicationResult {
+  status: 'published' | 'error';
+  at: ISODate;
+  /** Lien du post publié. */
+  url?: string;
+  error?: string;
+}
+
+export type ContentOriginType = 'meeting' | 'discussion' | 'underexplored' | 'trend' | 'manual';
 
 export interface ContentAdaptation {
   network: Exclude<Network, 'tiktok'>;
@@ -516,7 +617,24 @@ export interface Content {
   video?: { title: string; duration: string; script: string[] };
   generations: number;
   errorMessage?: string;
+  /** Image créée par l'agent (servie par l'API, adresse publique une fois le serveur en ligne). */
+  image?: UploadedFile;
+  /** Description de l'image (accessibilité, texte alternatif). */
+  imageAlt?: string;
+  /** Échec de la dernière création du post par l'agent. */
+  generationError?: string;
+  /** Résultat de la publication, réseau par réseau. */
+  publications?: Partial<Record<Network, PublicationResult>>;
   history: { date: ISODate; text: string }[];
+}
+
+/** Retouches possibles avant publication : sujet, réseaux, textes par réseau et date de publication. */
+export interface ContentUpdate {
+  title?: string;
+  objective?: string;
+  networks?: Network[];
+  captions?: Partial<Record<Network, string>>;
+  scheduledAt?: ISODate;
 }
 
 export type ContentAction =
@@ -526,7 +644,7 @@ export type ContentAction =
   | 'request_changes'
   | 'submit_topic'
   | 'retry'
-  | 'simulate_error';
+  | 'publish_now';
 
 export interface NewIdeaInput {
   projectId: string;
@@ -602,11 +720,15 @@ export interface Conversation {
   title: string;
   messages: ChatMessage[];
   suggestions: string[];
+  /** Discussion éditoriale de la semaine : dates à remplir et posts créés une fois les idées validées. */
+  editorial?: { week: string; slots: ISODate[]; networks: Network[]; confirmedAt?: ISODate; contentIds: string[] };
 }
 
 export interface NewConversationInput {
   agentId: string;
   projectId: string;
+  /** Nouvelle discussion même s'il en existe déjà une avec cet agent sur ce projet. */
+  fresh?: boolean;
 }
 
 /* ---------- Notifications & activité ---------- */
@@ -667,8 +789,13 @@ export interface Automation {
   enabled: boolean;
 }
 
+/** Tâches IA du flux de création de site, chacune confiée à un agent choisi dans le cockpit. */
+export type SiteTask = 'design' | 'development';
+
 export interface Settings {
   profile: { name: string; email: string; role: string; timezone: string };
+  /** Agent qui réalise chaque tâche IA du flux de création de site (Paramètres → Agents IA). */
+  siteAgents: Record<SiteTask, string>;
   notifications: Record<'validations' | 'alerts' | 'weeklyReport' | 'publications', boolean>;
   automations: Automation[];
   budget: { monthlyLimit: number; maxGenerationsPerContent: number; alertThreshold: number };

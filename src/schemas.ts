@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MEMORY_MAX_LENGTH, SPECIALTY_IDS } from './core';
 
 const text = (max = 2000) => z.string().trim().min(1).max(max);
 const optionalText = (max = 2000) => z.string().trim().max(max).default('');
@@ -33,8 +34,37 @@ export const newIdea = z.object({
   scheduledAt: isoDate,
 });
 export const contentActionBody = z.object({
-  action: z.enum(['submit_topic', 'validate_topic', 'another_idea', 'validate_visual', 'request_changes', 'retry', 'simulate_error']),
+  action: z.enum(['submit_topic', 'validate_topic', 'another_idea', 'validate_visual', 'request_changes', 'retry', 'publish_now']),
   comment: z.string().trim().max(2000).optional(),
+});
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Heure au format HH:mm');
+export const editorialPatch = z
+  .object({
+    enabled: z.boolean(),
+    days: z.array(z.number().int().min(1).max(7)).min(1).max(7),
+    time: hhmm,
+    // TikTok viendra avec la génération de vidéos.
+    networks: z.array(z.enum(['instagram', 'facebook', 'linkedin'])).min(1),
+    agentId: text(80),
+    briefDay: z.number().int().min(1).max(7),
+    briefTime: hhmm,
+  })
+  .partial();
+export const editorialIdeas = z.object({
+  ideas: z.array(z.object({ title: text(200), objective: optionalText(1000), scheduledAt: isoDate })).min(1).max(7),
+});
+
+export const newPostIdea = z.object({ title: text(200), reason: optionalText(500) });
+export const ideaLink = z.object({ conversationId: text(80) });
+export const ideaStatus = z.object({ status: z.enum(['proposed', 'kept', 'dismissed']) });
+export const ideaValidation = z.object({ scheduledAt: isoDate });
+
+export const contentPatch = z.object({
+  title: text(200).optional(),
+  objective: z.string().trim().max(2000).optional(),
+  networks: z.array(z.enum(['instagram', 'facebook', 'linkedin'])).min(1).optional(),
+  captions: z.record(network, z.string().max(5000)).optional(),
+  scheduledAt: isoDate.optional(),
 });
 
 export const newMeeting = z.object({
@@ -47,20 +77,26 @@ export const newMeeting = z.object({
   agenda: z.array(text(300)).default([]),
   startNow: z.boolean().default(false),
 });
-export const newConversation = z.object({ agentId: text(80), projectId: text(80) });
+export const newConversation = z.object({ agentId: text(80), projectId: text(80), fresh: z.boolean().optional() });
+
+const agentModel = z.object({ provider: z.enum(['claude', 'openrouter']), model: text(120) });
 
 const agentFields = {
   name: text(80),
-  kind: z.enum(['developer', 'webdesign', 'communication', 'finance', 'coordinator']),
-  role: text(120),
-  specialty: text(300),
+  kind: z.enum(SPECIALTY_IDS),
   instructions: optionalText(4000),
   projectIds: z.array(z.string()).default([]),
-  enabled: z.boolean().default(true),
-  permissions: z.object({ createTasks: z.boolean(), requireValidation: z.boolean() }).default({ createTasks: true, requireValidation: true }),
+  models: z.object({ task: agentModel, chat: agentModel }).optional(),
 };
 export const newAgent = z.object(agentFields);
 export const agentPatch = z.object(agentFields).partial();
+
+export const agentMemory = z.object({
+  text: text(MEMORY_MAX_LENGTH),
+  source: z.enum(['manual', 'conversation', 'meeting', 'project']).default('manual'),
+  sourceId: z.string().max(80).nullable().default(null),
+});
+export const agentMemoryPatch = z.object({ text: text(MEMORY_MAX_LENGTH) });
 export const meetingStatus = z.object({ status: z.enum(['planned', 'in_progress', 'done']) });
 export const meetingItem = z.object({ kind: z.enum(['decisions', 'ideas', 'followUps']), text: text(500) });
 
@@ -74,6 +110,7 @@ export const chatMessage = z.object({
 export const settingsPatch = z
   .object({
     profile: z.object({ name: text(120), email, role: optionalText(120), timezone: text(60) }),
+    siteAgents: z.object({ design: text(80), development: text(80) }),
     notifications: z.object({ validations: z.boolean(), alerts: z.boolean(), weeklyReport: z.boolean(), publications: z.boolean() }),
     budget: z.object({
       monthlyLimit: z.number().min(0).max(100000),

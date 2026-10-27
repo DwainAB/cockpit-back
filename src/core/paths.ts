@@ -13,7 +13,11 @@ export const RESTAURANT_PROJECT = PROJECT_IDS.yumco;
 /** URL de l'interface, partagées par le frontend, les notifications et l'historique d'activité. */
 export const paths = {
   home: () => '/',
-  discussions: (threadId?: string) => (threadId ? `/discussions/${threadId}` : '/discussions'),
+  /** Discussions d'un projet (`projectId`) ou de tous les projets (réunions transverses comprises). */
+  discussions: (threadId?: string, projectId?: string | null) => {
+    const base = projectId ? `/p/${projectId}/discussions` : '/discussions';
+    return threadId ? `${base}/${threadId}` : base;
+  },
   tasks: (taskId?: string) => (taskId ? `/tasks?task=${taskId}` : '/tasks'),
   finance: (projectId?: string) => (projectId ? `/p/${projectId}/finance` : '/finance'),
   agents: (agentId?: string) => (agentId ? `/agents?agent=${agentId}` : '/agents'),

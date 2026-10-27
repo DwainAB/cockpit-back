@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { createDb, type Db, type DomainContext, type Restaurant } from './core';
+import { createDb, DEFAULT_SITE_AGENTS, normalizeAgent, type Db, type DomainContext, type Restaurant } from './core';
 import { cockpitDb, COLLECTIONS, migrateCockpitDb, yumcoDbEnabled } from './db';
 import { fetchYumcoRestaurants, profileOf, yumcoIdOf, type RestaurantProfile } from './yumcoRestaurants';
 import { config } from './config';
@@ -54,7 +54,11 @@ class Store extends EventEmitter {
       loaded[name] = rows.sort((a, b) => (rank.get(a.id) ?? order.length) - (rank.get(b.id) ?? order.length)).map((r) => r.data);
     }
     loaded.settings = state.get('settings') as Db['settings'];
+    // Réglages antérieurs aux agents du flux de création de site.
+    loaded.settings.siteAgents = { ...DEFAULT_SITE_AGENTS, ...loaded.settings.siteAgents };
     if (state.has('finance')) loaded.finance = state.get('finance') as Db['finance'];
+    // Anciennes données : complète modèle, couleur et mémoire à partir de la spécialité.
+    loaded.agents.forEach(normalizeAgent);
     const { rows: profiles } = await db.query<{ yumco_restaurant_id: number; data: RestaurantProfile }>('select yumco_restaurant_id, data from restaurant_profiles');
     this.profiles = new Map(profiles.map((p) => [p.yumco_restaurant_id, p.data]));
 

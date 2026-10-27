@@ -50,6 +50,7 @@ export const createFinance = (): FinanceData => ({
 
 export const createSettings = (): Settings => ({
   profile: { name: 'Alex Martin', email: 'alex@cockpit.example', role: 'Direction', timezone: 'Europe/Paris' },
+  siteAgents: { design: AGENT.design, development: AGENT.dev },
   notifications: { validations: true, alerts: true, weeklyReport: true, publications: false },
   automations: [
     { id: 'auto-1', projectId: null, name: 'Proposition éditoriale du lundi', description: 'L’agent communication propose les sujets de la semaine chaque lundi à 9:00, pour chaque projet.', schedule: 'Chaque lundi · 09:00', enabled: true },

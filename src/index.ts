@@ -6,6 +6,9 @@ import { resumeQueue } from './designer';
 import { resumeDeliveries } from './delivery';
 import { resumeBuilds } from './developer';
 import { startImporter } from './importer';
+import { warmUpMemorySearch } from './memorySearch';
+import { startEditorialScheduler } from './editorial';
+import { startSocialScheduler } from './social';
 import { startPreviewServer } from './preview';
 import { store } from './store';
 
@@ -20,12 +23,15 @@ const start = async () => {
   server = createApp().listen(config.port, () => {
     console.log(`[api] Cockpit API sur http://localhost:${config.port}/api`);
     console.log(`[api] base du cockpit : PostgreSQL · restaurants : ${config.yumcoDatabaseUrl ? 'base Yumco' : 'aucune base Yumco configurée'}`);
+    warmUpMemorySearch();
+    startSocialScheduler();
+    startEditorialScheduler();
     resumeQueue();
     resumeBuilds();
     resumeDeliveries();
     startImporter();
     console.log(
-      `[api] génération du design : ${config.designGenerator === 'claude' ? `Claude (${config.designModel}, effort ${config.designEffort})` : 'simulée (aucune clé API)'}`,
+      `[api] génération du design : ${config.designGenerator === 'ai' ? `IA (modèle de l’agent webdesign, effort ${config.designEffort})` : 'simulée (aucune clé API)'}`,
     );
   });
 };

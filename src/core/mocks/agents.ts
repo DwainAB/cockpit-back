@@ -1,5 +1,6 @@
-import type { Agent } from '../types';
+import type { Agent, AgentKind } from '../types';
 import { rel } from '../dates';
+import { defaultModels, specialtyOf } from '../specialties';
 
 export const AGENT = {
   dev: 'agent-dev',
@@ -9,85 +10,85 @@ export const AGENT = {
   coord: 'agent-coord',
 } as const;
 
+/** Couleur et modèles viennent du catalogue de spécialités. */
+const identity = (kind: AgentKind) => ({ color: specialtyOf(kind).color, models: defaultModels(kind) });
+
+/** Souvenir d'exemple, daté relativement à aujourd'hui. */
+const memo = (id: string, text: string, days: number) => ({
+  id,
+  text,
+  source: 'manual' as const,
+  sourceId: null,
+  createdAt: rel(days, 9, 0),
+});
+
 export const createAgents = (): Agent[] => [
   {
     id: AGENT.coord,
     kind: 'coordinator',
     name: 'Otto',
-    role: 'Agent coordinateur',
-    specialty: 'Orchestration des étapes, relances clients, rapports hebdomadaires',
-    description: "Fait circuler l'information entre les agents, prépare l'ordre du jour des réunions et signale ce qui attend une décision.",
     availability: 'available',
     projectIds: ['yumco', 'argos', 'diagnoskin'],
     lastActivity: { date: rel(0, 8, 42), text: 'A préparé le rapport hebdomadaire (brouillon)' },
     issue: null,
-    enabled: true,
     instructions: 'Prépare l’ordre du jour des réunions, relance les clients et signale tout ce qui attend une décision. Ne prends aucune décision à ma place.',
-    permissions: { createTasks: true, requireValidation: true },
-    color: '#3B4A9E',
+    ...identity('coordinator'),
+    memories: [memo('mem-coord-1', 'Le rapport hebdomadaire est envoyé le vendredi à 16 h.', -14)],
   },
   {
     id: AGENT.design,
     kind: 'webdesign',
     name: 'Maya',
-    role: 'Agent webdesign',
-    specialty: 'Maquettes, chartes graphiques, versions visuelles des sites',
-    description: 'Conçoit les maquettes et les versions visuelles à partir de la fiche restaurant et des photos fournies.',
     availability: 'busy',
     projectIds: ['yumco'],
     lastActivity: { date: rel(0, 10, 5), text: 'A soumis la version visuelle de Sakura Ramen' },
     issue: null,
-    enabled: true,
     instructions: 'Propose des maquettes sobres et lisibles sur mobile. Utilise en priorité les photos fournies par le restaurant.',
-    permissions: { createTasks: true, requireValidation: true },
-    color: '#A54C9E',
+    ...identity('webdesign'),
+    memories: [
+      memo('mem-design-1', 'Charte Yumco : tons chauds, typographie éditoriale et photos plein écran.', -30),
+      memo('mem-design-2', 'Sakura Ramen préfère un fond crème et refuse les aplats rouges vifs.', -6),
+    ],
   },
   {
     id: AGENT.dev,
     kind: 'developer',
-    name: 'Axel',
-    role: 'Agent développeur',
-    specialty: 'Intégration, fonctionnalités, tests automatiques',
-    description: 'Développe les fonctionnalités (menu, réservation, contact), lance les tests prédéfinis et prépare la mise en ligne.',
+    name: 'Guwon',
     availability: 'busy',
     projectIds: ['yumco'],
     lastActivity: { date: rel(0, 7, 55), text: 'Test « Réservation mobile » en échec sur Trattoria Nonna Lucia' },
     issue: null,
-    enabled: true,
     instructions: 'Développe les fonctionnalités, lance la suite de tests prédéfinie et bloque l’étape si un test échoue.',
-    permissions: { createTasks: true, requireValidation: true },
-    color: '#2F7A5B',
+    // Guwon réalise les sites du flux de création : code avec Claude, discute avec Nvidia (gratuit).
+    color: specialtyOf('developer').color,
+    models: {
+      task: { provider: 'claude', model: 'claude-opus-5-5' },
+      chat: { provider: 'openrouter', model: 'nvidia/nemotron-3.5-super-vl:free' },
+    },
+    memories: [memo('mem-dev-1', 'Les sites restaurants doivent garder un score Lighthouse mobile supérieur ou égal à 90.', -21)],
   },
   {
     id: AGENT.com,
     kind: 'communication',
     name: 'Lina',
-    role: 'Agent communication',
-    specialty: 'Ligne éditoriale, captions, visuels et vidéos courtes',
-    description: 'Propose les sujets de la semaine, rédige les textes par réseau et prépare les visuels à valider.',
     availability: 'available',
     projectIds: ['yumco', 'argos', 'diagnoskin'],
     lastActivity: { date: rel(-1, 17, 20), text: 'A proposé 3 pistes pour la semaine prochaine' },
     issue: null,
-    enabled: true,
     instructions: 'Propose 2 sujets par semaine et par projet. Une image maître déclinée par réseau ; TikTok reste un format vidéo distinct. Toujours soumettre avant publication.',
-    permissions: { createTasks: true, requireValidation: true },
-    color: '#BF7514',
+    ...identity('communication'),
+    memories: [memo('mem-com-1', 'Éviter les publications le dimanche soir : privilégier mardi et jeudi à 11 h.', -10)],
   },
   {
     id: AGENT.fin,
     kind: 'finance',
     name: 'Victor',
-    role: 'Agent finance',
-    specialty: 'Abonnements, estimation des coûts IA, suivi Stripe (mocké)',
-    description: 'Suit les abonnements, estime les coûts de génération et prépare les invitations de paiement.',
     availability: 'offline',
     projectIds: ['yumco', 'argos', 'diagnoskin'],
     lastActivity: { date: rel(-1, 18, 0), text: 'Estimation mensuelle des coûts IA mise à jour' },
     issue: null,
-    enabled: true,
     instructions: 'Estime les coûts IA par projet et alerte au-delà de 80 % du budget. Ne manipule jamais de données bancaires.',
-    permissions: { createTasks: true, requireValidation: true },
-    color: '#3FA0C8',
+    ...identity('finance'),
+    memories: [],
   },
 ];

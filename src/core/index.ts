@@ -1,4 +1,5 @@
 export * from './types';
+export * from './specialties';
 export * from './dates';
 export * from './labels';
 export * from './workflow';

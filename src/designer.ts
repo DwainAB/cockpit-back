@@ -7,9 +7,11 @@ import path from 'node:path';
 import type Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import * as z from 'zod/v4';
-import { completeDesign, contrastMinimum, contrastRatio, dayKeys, dayLabels, formatAddress, formatDayHours, serviceLines, type DesignResult, type DesignUsage, failDesign, type QuestionnaireAnswers, simulateDesign, type SiteDraft, startDesign } from './core';
+import { completeDesign, RESTAURANT_PROJECT, siteAgent, contrastMinimum, contrastRatio, dayKeys, dayLabels, formatAddress, formatDayHours, serviceLines, type DesignResult, type DesignUsage, failDesign, type QuestionnaireAnswers, simulateDesign, type SiteDraft, startDesign } from './core';
 import { addUsage, claude, errorMessage, fallbackParams, responseText, usageOf } from './claude';
 import { config } from './config';
+import { memoryContext } from './memorySearch';
+import { openrouterJson } from './openrouter';
 import { store } from './store';
 import { uploadPath } from './uploads';
 
@@ -193,40 +195,57 @@ const auditDesign = (out: z.infer<typeof DesignOutput>) => {
 
 const MAX_DESIGN_FIXES = 2;
 
+const fixRequest = (problems: string[]) =>
+  `Les contrôles automatiques d'accessibilité ont échoué :\n${problems.map((p) => `- ${p}`).join('\n')}\nCorrige la maquette (en ajustant les couleurs si nécessaire) et renvoie la réponse complète.`;
+
 const callClaude = async (draft: SiteDraft, versionId: string): Promise<{ result: DesignResult; usage: DesignUsage }> => {
-  const agent = store.snapshot.agents.find((a) => a.kind === 'webdesign');
-  if (agent && !agent.enabled) throw new Error('L’agent webdesign est désactivé (page Agents).');
-  const system = agent?.instructions ? `${SYSTEM_PROMPT}\n\nConsignes permanentes de l'agent (définies par le studio) :\n${agent.instructions}` : SYSTEM_PROMPT;
-  const model = config.designModel;
-  const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: 'user', content: buildRequest(draft, versionId) }];
+  // L'agent choisi pour la maquette (Paramètres → Agents IA) la réalise avec son modèle « tâches ».
+  const agent = siteAgent(store.snapshot, 'design');
+  if (!agent) throw new Error('Aucun agent n’est chargé des maquettes (Paramètres → Agents IA).');
+  // Requête de récupération mémoire : les souvenirs liés à ce restaurant remontent en priorité.
+  const memoryQuery = [draft.answers.name, draft.answers.restaurantType, draft.answers.customRequests, draft.answers.branding.colors.join(' '), draft.answers.branding.font ?? ''].join(' ');
+  const system = `${SYSTEM_PROMPT}\n\nConsignes permanentes de l'agent (définies par le studio) :\n${await memoryContext(agent, memoryQuery, RESTAURANT_PROJECT)}`;
+  const { provider, model } = agent.models.task;
+  const request = buildRequest(draft, versionId);
+  const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: 'user', content: request }];
   let usage: DesignUsage | null = null;
+  let previous: { output: z.infer<typeof DesignOutput>; problems: string[] } | null = null;
 
   for (let attempt = 0; ; attempt++) {
-    const stream = claude().beta.messages.stream({
-      model,
-      max_tokens: 64000,
-      thinking: { type: 'adaptive' },
-      output_config: { effort: config.designEffort, format: zodOutputFormat(DesignOutput) },
-      system,
-      messages,
-      // En cas de refus d'un classifieur de sécurité, l'API relance la demande sur un modèle adapté.
-      ...fallbackParams(model),
-    });
-    const message = await stream.finalMessage();
-    usage = addUsage(usage, usageOf(message, model));
-
-    const parsed = DesignOutput.parse(JSON.parse(responseText(message)));
+    let parsed: z.infer<typeof DesignOutput>;
+    let message: Anthropic.Beta.BetaMessage | null = null;
+    if (provider === 'openrouter') {
+      // OpenRouter : appel sans historique, la réponse précédente et les erreurs sont renvoyées dans la demande.
+      const content: Anthropic.Beta.BetaContentBlockParam[] = previous
+        ? [...request, { type: 'text', text: `<reponse_precedente>\n${JSON.stringify(previous.output)}\n</reponse_precedente>\n${fixRequest(previous.problems)}` }]
+        : request;
+      const out = await openrouterJson({ model, system, content, schema: DesignOutput, maxTokens: 64000, effort: config.designEffort });
+      usage = addUsage(usage, out.usage);
+      parsed = out.output;
+    } else {
+      const stream = claude().beta.messages.stream({
+        model,
+        max_tokens: 64000,
+        thinking: { type: 'adaptive' },
+        output_config: { effort: config.designEffort, format: zodOutputFormat(DesignOutput) },
+        system,
+        messages,
+        // En cas de refus d'un classifieur de sécurité, l'API relance la demande sur un modèle adapté.
+        ...fallbackParams(model),
+      });
+      message = await stream.finalMessage();
+      usage = addUsage(usage, usageOf(message, model));
+      parsed = DesignOutput.parse(JSON.parse(responseText(message)));
+    }
     if (!/<html[\s>]/i.test(parsed.html) || !/data-section=/.test(parsed.html)) throw new Error('Le HTML généré est incomplet. Relancez la génération.');
     const audit = auditDesign(parsed);
     const notes = audit.problems.length ? [...parsed.notes, `Contrôles encore en échec après ${attempt + 1} essai(s) : ${audit.problems.join(' ; ')}`] : parsed.notes;
     if (!audit.problems.length || attempt >= MAX_DESIGN_FIXES) return { result: { ...parsed, notes, contrasts: audit.contrasts }, usage };
 
     console.log(`[design] ${draft.answers.name} : ${audit.problems.length} contrôle(s) en échec, correction automatique`);
-    // L'historique est conservé tel quel (y compris la réflexion) : on ajoute seulement la demande de correction.
-    messages.push(
-      { role: 'assistant', content: message.content },
-      { role: 'user', content: `Les contrôles automatiques d'accessibilité ont échoué :\n${audit.problems.map((p) => `- ${p}`).join('\n')}\nCorrige la maquette (en ajustant les couleurs si nécessaire) et renvoie la réponse complète.` },
-    );
+    previous = { output: parsed, problems: audit.problems };
+    // Claude : l'historique est conservé tel quel (y compris la réflexion) ; on ajoute seulement la demande de correction.
+    if (message) messages.push({ role: 'assistant', content: message.content }, { role: 'user', content: fixRequest(audit.problems) });
   }
 };
 
